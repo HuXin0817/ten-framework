@@ -1,7 +1,7 @@
 import asyncio
+from datetime import datetime
 import json
 import time
-import os
 from typing import Literal
 
 from .agent.decorators import agent_event_handler
@@ -22,11 +22,19 @@ from .agent.events import (
 )
 from .helper import _send_cmd, _send_data, parse_sentences
 from .config import MainControlConfig  # assume extracted from your base model
+from .prompt import (
+    CONTEXT_MESSAGE_WITH_MEMORY_TEMPLATE,
+    PERSONALIZED_GREETING_TEMPLATE,
+)
 
 import uuid
 
 # Memory store abstraction
-from .memory import MemoryStore, MemuSdkMemoryStore, MemuHttpMemoryStore
+from .memory import (
+    MemoryStore,
+    PowerMemSdkMemoryStore,
+    PowerMemSdkUserMemoryStore,
+)
 
 
 class MainControlExtension(AsyncExtension):
@@ -47,8 +55,16 @@ class MainControlExtension(AsyncExtension):
         self.turn_id: int = 0
         self.session_id: str = "0"
 
-        # Memory related attributes (named memu_client by request)
-        self.memu_client: MemoryStore | None = None
+        # Memory related attributes (named memory_store by request)
+        self.memory_store: MemoryStore | None = None
+        self.last_memory_update_turn_id: int = 0
+
+        # Memory idle timer: save memory after 30 seconds of inactivity
+        self._memory_idle_timer_task: asyncio.Task | None = None
+
+        # Greeting generation state
+        self._is_generating_greeting: bool = False
+        self._greeting_future: asyncio.Future[str] | None = None
 
     def _current_metadata(self) -> dict:
         return {"session_id": self.session_id, "turn_id": self.turn_id}
@@ -60,24 +76,14 @@ class MainControlExtension(AsyncExtension):
         config_json, _ = await ten_env.get_property_to_json(None)
         self.config = MainControlConfig.model_validate_json(config_json)
 
-        # Initialize memory store per config toggle
-        if self.config.self_hosting:
-            self.memu_client = MemuHttpMemoryStore(
-                env=ten_env,
-                base_url=self.config.memu_base_url,
-                api_key=self.config.memu_api_key,
-            )
-        else:
-            self.memu_client = MemuSdkMemoryStore(
-                env=ten_env,
-                base_url=self.config.memu_base_url,
-                api_key=self.config.memu_api_key,
-            )
+        # Initialize memory store
+        if self.config and self.config.enable_memorization:
+            if self.config.enable_user_memory:
+                self.memory_store = PowerMemSdkMemoryStore(env=ten_env)
+            else:
+                self.memory_store = PowerMemSdkUserMemoryStore(env=ten_env)
 
         self.agent = Agent(ten_env)
-
-        # Load memory summary and write into LLM context
-        await self._load_memory_to_context()
 
         # Now auto-register decorated methods
         for attr_name in dir(self):
@@ -90,11 +96,29 @@ class MainControlExtension(AsyncExtension):
     @agent_event_handler(UserJoinedEvent)
     async def _on_user_joined(self, event: UserJoinedEvent):
         self._rtc_user_count += 1
-        if self._rtc_user_count == 1 and self.config and self.config.greeting:
-            await self._send_to_tts(self.config.greeting, True)
-            await self._send_transcript(
-                "assistant", self.config.greeting, True, 100
-            )
+        if self._rtc_user_count == 1:
+            # Generate personalized greeting based on user memories
+            personalized_greeting = await self._generate_personalized_greeting()
+            if personalized_greeting:
+                self.ten_env.log_info(
+                    f"[MainControlExtension] Using personalized greeting: {personalized_greeting[:100]}..."
+                )
+                if self.config:
+                    self.config.greeting = personalized_greeting
+
+                await self._send_to_tts(personalized_greeting, True)
+                await self._send_transcript(
+                    "assistant", personalized_greeting, True, 100
+                )
+            elif self.config and self.config.greeting:
+                self.ten_env.log_info(
+                    "[MainControlExtension] No personalized greeting generated, using default greeting"
+                )
+
+                await self._send_to_tts(self.config.greeting, True)
+                await self._send_transcript(
+                    "assistant", self.config.greeting, True, 100
+                )
 
     @agent_event_handler(UserLeftEvent)
     async def _on_user_left(self, event: UserLeftEvent):
@@ -114,11 +138,15 @@ class MainControlExtension(AsyncExtension):
             await self._interrupt()
         if event.final:
             self.turn_id += 1
+            # Cancel memory idle timer since user started a new conversation
+            self._cancel_memory_idle_timer()
             # Use user's query to search for related memories and pass to LLM
             related_memory = await self._retrieve_related_memory(event.text)
             if related_memory:
                 # Add related memory as context to LLM input
-                context_message = f"[Related Memory Context]\n{related_memory}\n\n[Current User Question]\n{event.text}"
+                context_message = CONTEXT_MESSAGE_WITH_MEMORY_TEMPLATE.format(
+                    related_memory=related_memory, user_query=event.text
+                )
                 await self.agent.queue_llm_input(context_message)
             else:
                 await self.agent.queue_llm_input(event.text)
@@ -126,6 +154,37 @@ class MainControlExtension(AsyncExtension):
 
     @agent_event_handler(LLMResponseEvent)
     async def _on_llm_response(self, event: LLMResponseEvent):
+        # Check if we're generating a personalized greeting
+        if self._is_generating_greeting and event.type == "message":
+            # For greeting generation, only handle final response
+            if event.is_final:
+                # Set the future with the greeting text and reset state
+                if self._greeting_future and not self._greeting_future.done():
+                    self._greeting_future.set_result(event.text)
+                self._is_generating_greeting = False
+                self._greeting_future = None
+                # Don't send greeting to TTS here - it will be sent in _on_user_joined
+                # But still send transcript for logging
+                await self._send_transcript(
+                    "assistant",
+                    event.text,
+                    event.is_final,
+                    100,
+                    data_type="text",
+                )
+            # For non-final events during greeting generation, just log transcript
+            # but don't send to TTS (to avoid duplicate output)
+            else:
+                await self._send_transcript(
+                    "assistant",
+                    event.text,
+                    event.is_final,
+                    100,
+                    data_type="text",
+                )
+            return
+
+        # Normal LLM response handling
         if not event.is_final and event.type == "message":
             sentences, self.sentence_fragment = parse_sentences(
                 self.sentence_fragment, event.delta
@@ -138,9 +197,22 @@ class MainControlExtension(AsyncExtension):
             self.sentence_fragment = ""
             await self._send_to_tts(remaining_text, True)
 
-            # Memorize every two rounds (when turn_id is even) if memorization is enabled
-            if self.turn_id % 2 == 0 and self.config.enable_memorization:
-                await self._memorize_conversation()
+            # Memorize every N rounds if memorization is enabled
+            if (
+                self.turn_id - self.last_memory_update_turn_id >= self.config.memory_save_interval_turns
+                and self.config.enable_memorization
+            ):
+                # Update counter immediately to prevent race condition from concurrent saves
+                # This ensures only one save task is triggered even if multiple responses arrive quickly
+                current_turn_id = self.turn_id
+                self.last_memory_update_turn_id = current_turn_id
+                # Save memory asynchronously without blocking LLM response processing
+                asyncio.create_task(self._memorize_conversation())
+                # Cancel idle timer since we just saved memory
+                self._cancel_memory_idle_timer()
+            elif self.config.enable_memorization:
+                # Start/reset idle timer to save memory if no new conversation
+                self._start_memory_idle_timer()
 
         await self._send_transcript(
             "assistant",
@@ -156,7 +228,10 @@ class MainControlExtension(AsyncExtension):
     async def on_stop(self, ten_env: AsyncTenEnv):
         ten_env.log_info("[MainControlExtension] on_stop")
         self.stopped = True
+        # Cancel idle timer before stopping
+        self._cancel_memory_idle_timer()
         await self.agent.stop()
+        await self._memorize_conversation()
 
     async def on_cmd(self, ten_env: AsyncTenEnv, cmd: Cmd):
         await self.agent.on_cmd(cmd)
@@ -249,30 +324,123 @@ class MainControlExtension(AsyncExtension):
 
     # === Memory related methods ===
 
-    async def _retrieve_memory(self, user_id: str = None) -> str:
-        """Retrieve conversation memory from configured store"""
-        if not self.memu_client:
+    def _cancel_memory_idle_timer(self):
+        """Cancel the memory idle timer if it exists"""
+        if self._memory_idle_timer_task and not self._memory_idle_timer_task.done():
+            self._memory_idle_timer_task.cancel()
+            self._memory_idle_timer_task = None
+            self.ten_env.log_info(
+                "[MainControlExtension] Cancelled memory idle timer"
+            )
+
+    def _start_memory_idle_timer(self):
+        """Start or reset the 30-second idle timer to save memory"""
+        # Cancel existing timer if any
+        self._cancel_memory_idle_timer()
+
+        async def _memory_idle_timeout():
+            """Wait for configured idle timeout and then save memory if there are unsaved conversations"""
+            # Capture reference to this task to avoid race condition
+            current_task = asyncio.current_task()
+            timeout_seconds = self.config.memory_idle_timeout_seconds
+            try:
+                await asyncio.sleep(timeout_seconds)
+                # Check if there are unsaved conversations
+                if (
+                    self.turn_id > self.last_memory_update_turn_id
+                    and self.config.enable_memorization
+                    and not self.stopped
+                ):
+                    self.ten_env.log_info(
+                        f"[MainControlExtension] {timeout_seconds} seconds idle timeout reached, "
+                        f"saving memory (turn_id={self.turn_id}, "
+                        f"last_saved_turn_id={self.last_memory_update_turn_id})"
+                    )
+                    await self._memorize_conversation()
+                # Only clear if this task is still the current timer task
+                if self._memory_idle_timer_task is current_task:
+                    self._memory_idle_timer_task = None
+            except asyncio.CancelledError:
+                # Timer was cancelled, which is expected
+                # Only clear if this task is still the current timer task
+                if self._memory_idle_timer_task is current_task:
+                    self._memory_idle_timer_task = None
+            except Exception as e:
+                self.ten_env.log_error(
+                    f"[MainControlExtension] Error in memory idle timer: {e}"
+                )
+                # Only clear if this task is still the current timer task
+                if self._memory_idle_timer_task is current_task:
+                    self._memory_idle_timer_task = None
+
+        # Start new timer task
+        self._memory_idle_timer_task = asyncio.create_task(
+            _memory_idle_timeout())
+        self.ten_env.log_info(
+            f"[MainControlExtension] Started {self.config.memory_idle_timeout_seconds}-second memory idle timer"
+        )
+
+    async def _generate_personalized_greeting(self) -> str:
+        """
+        Generate a personalized greeting based on user memories.
+        Returns an empty string if no memories are found or if generation fails.
+        """
+        if not self.memory_store or not self.config.enable_memorization:
             return ""
 
         try:
-            user_id = self.config.user_id
-            agent_id = self.config.agent_id
-            resp = await self.memu_client.retrieve_default_categories(
-                user_id=user_id, agent_id=agent_id
+            # Retrieve user memory summary
+            memory_summary = await self._retrieve_related_memory(
+                query="user preferences, past conversations, and personal information",
             )
-            normalized = self.memu_client.parse_default_categories(resp)
-            return self._extract_summary_text(normalized)
+
+            if not memory_summary or not memory_summary.strip():
+                # No memories found, return empty to use default greeting
+                return ""
+
+            # Construct prompt for personalized greeting
+            greeting_prompt = PERSONALIZED_GREETING_TEMPLATE.format(
+                memory_summary=memory_summary
+            )
+
+            # Create a future to wait for the greeting response
+            self._greeting_future = asyncio.Future()
+            self._is_generating_greeting = True
+
+            # Queue the greeting prompt to LLM
+            await self.agent.queue_llm_input(greeting_prompt)
+
+            # Wait for the greeting response (with timeout)
+            try:
+                greeting = await asyncio.wait_for(self._greeting_future, timeout=10.0)
+                self.ten_env.log_info(
+                    f"[MainControlExtension] Generated personalized greeting: {greeting}"
+                )
+                return greeting
+            except asyncio.TimeoutError:
+                # Timeout - cancel the future and reset state
+                self.ten_env.log_warn(
+                    "[MainControlExtension] Greeting generation timed out"
+                )
+                if not self._greeting_future.done():
+                    self._greeting_future.cancel()
+                self._is_generating_greeting = False
+                self._greeting_future = None
+                return ""
+
         except Exception as e:
             self.ten_env.log_error(
-                f"[MainControlExtension] Failed to retrieve memory: {e}"
+                f"[MainControlExtension] Failed to generate personalized greeting: {e}"
             )
+            self._is_generating_greeting = False
+            if self._greeting_future and not self._greeting_future.done():
+                self._greeting_future.cancel()
+            self._greeting_future = None
             return ""
 
-    async def _retrieve_related_memory(
-        self, query: str, user_id: str = None
-    ) -> str:
+    async def _retrieve_related_memory(self, query: str) -> str:
         """Retrieve related memory based on user query using semantic search"""
-        if not self.memu_client:
+        if not self.memory_store:
             return ""
 
         try:
@@ -284,15 +452,27 @@ class MainControlExtension(AsyncExtension):
             )
 
             # Call semantic search API
-            resp = await self.memu_client.retrieve_related_clustered_categories(
-                user_id=user_id, agent_id=agent_id, category_query=query
+            resp = await self.memory_store.search(
+                user_id=user_id, agent_id=agent_id, query=query
             )
 
-            # Parse response
-            parsed = self.memu_client.parse_related_clustered_categories(resp)
+            if not resp or not isinstance(resp, dict):
+                return ""
 
-            # Extract memory text
-            memory_text = self._extract_related_memory_text(parsed)
+            # Extract memory content from results using list comprehension
+            results = resp.get("results", [])
+            memorise = [
+                result["memory"]
+                for result in results
+                if isinstance(result, dict) and result.get("memory")
+            ]
+
+            # Format memory text using join for better performance
+            if memorise:
+                memory_text = "Memorise:\n" + \
+                    "\n".join(f"- {memory}" for memory in memorise) + "\n"
+            else:
+                memory_text = ""
 
             self.ten_env.log_info(
                 f"[MainControlExtension] Retrieved related memory (length: {len(memory_text)})"
@@ -305,79 +485,13 @@ class MainControlExtension(AsyncExtension):
             )
             return ""
 
-    def _parse_memory_summary(self, data) -> dict:
-        """Parse memory data and create summary"""
-        summary = {
-            "basic_stats": {
-                "total_categories": len(data.categories),
-                "total_memories": sum(
-                    cat.memory_count or 0 for cat in data.categories
-                ),
-                "user_id": (
-                    data.categories[0].user_id if data.categories else None
-                ),
-                "agent_id": (
-                    data.categories[0].agent_id if data.categories else None
-                ),
-            },
-            "categories": [],
-        }
-
-        for category in data.categories:
-            cat_summary = {
-                "name": category.name,
-                "type": category.type,
-                "memory_count": category.memory_count,
-                "is_active": category.is_active,
-                "recent_memories": [],
-                "summary": category.summary,
-            }
-
-            if category.memories:
-                recent = sorted(
-                    category.memories, key=lambda x: x.happened_at, reverse=True
-                )
-                for memory in recent:
-                    cat_summary["recent_memories"].append(
-                        {
-                            "date": memory.happened_at.strftime(
-                                "%Y-%m-%d %H:%M"
-                            ),
-                            "content": memory.content,
-                        }
-                    )
-
-            summary["categories"].append(cat_summary)
-
-        return summary
-
-    def _extract_summary_text(self, summary: dict) -> str:
-        """Extract summary text from parsed memory data"""
-        summary_text = ""
-        for category in summary["categories"]:
-            if category.get("summary"):
-                summary_text += category["summary"] + "\n"
-            elif category.get("recent_memories"):
-                # If no summary, extract content from recent memories
-                for memory in category["recent_memories"]:
-                    if memory.get("content"):
-                        summary_text += f"- {memory['content']}\n"
-        result = summary_text.strip()
-        self.ten_env.log_info(
-            f"[MainControlExtension] _extract_summary_text result: '{result}'"
-        )
-        return result
-
-    async def _memorize_conversation(
-        self, user_id: str = None, user_name: str = None
-    ):
+    async def _memorize_conversation(self):
         """Memorize the current conversation via configured store"""
-        if not self.memu_client:
+        if not self.memory_store:
             return
 
         try:
             user_id = self.config.user_id
-            user_name = self.config.user_name
 
             # Read context directly from llm_exec
             llm_context = (
@@ -396,93 +510,18 @@ class MainControlExtension(AsyncExtension):
 
             if not conversation_for_memory:
                 return
-            asyncio.create_task(
-                self.memu_client.memorize(
-                    conversation=conversation_for_memory,
-                    user_id=user_id,
-                    user_name=user_name,
-                    agent_id=self.config.agent_id,
-                    agent_name=self.config.agent_name,
-                )
+
+            await self.memory_store.add(
+                conversation=conversation_for_memory,
+                user_id=user_id,
+                agent_id=self.config.agent_id,
             )
+            # Update counter if not already updated (for on_stop and idle timeout cases)
+            # For LLM response case, counter is updated before creating the task to prevent race conditions
+            if self.turn_id > self.last_memory_update_turn_id:
+                self.last_memory_update_turn_id = self.turn_id
 
         except Exception as e:
             self.ten_env.log_error(
                 f"[MainControlExtension] Failed to memorize conversation: {e}"
             )
-
-    # Removed: _build_conversation_context (no longer keeping a separate context)
-
-    async def _load_memory_to_context(self):
-        """Load memory summary into LLM context at startup (as a system message)."""
-        if not self.memu_client:
-            return
-
-        try:
-            memory_summary = await self._retrieve_memory(self.config.user_id)
-            self.ten_env.log_info(
-                f"[MainControlExtension] Memory summary: {memory_summary}"
-            )
-            if memory_summary and self.agent and self.agent.llm_exec:
-                # Reset and write memory summary into context as a normal message (no system role handling)
-                self.agent.llm_exec.clear_context()
-                await self.agent.llm_exec.write_context(
-                    self.ten_env,
-                    "assistant",
-                    "Memory summary of previous conversations:\n\n"
-                    + memory_summary,
-                )
-                self.ten_env.log_info(
-                    "[MainControlExtension] Memory summary written into LLM context"
-                )
-        except Exception as e:
-            self.ten_env.log_error(
-                f"[MainControlExtension] Failed to load memory to context: {e}"
-            )
-
-    # Removed: _update_llm_context and _sync_context_from_llM (no separate context to sync)
-
-    def _extract_related_memory_text(self, parsed_data: dict) -> str:
-        """Extract and format text from related clustered categories search results"""
-        if not parsed_data or "categories" not in parsed_data:
-            return ""
-
-        parts = []
-        query = parsed_data.get("query", "")
-        total = parsed_data.get("total_categories", 0)
-
-        if total == 0:
-            return ""
-
-        # Add search result header information
-        parts.append(
-            f"Found {total} related memory categories based on query '{query}':\n"
-        )
-
-        # Iterate through each related category
-        for cat in parsed_data["categories"]:
-            cat_name = cat.get("name", "Unknown Category")
-            similarity = cat.get("similarity_score", 0)
-            memory_count = cat.get("memory_count", 0)
-
-            # Add category information
-            parts.append(
-                f"\n【{cat_name}】(Similarity: {similarity:.2f}, Memory Count: {memory_count})"
-            )
-
-            # Add category summary
-            if cat.get("summary"):
-                parts.append(f"  Summary: {cat['summary']}")
-
-            # Add recent memory content
-            if cat.get("recent_memories"):
-                parts.append("  Recent Memories:")
-                for mem in cat["recent_memories"][:3]:  # Only take the first 3
-                    date = mem.get("date", "")
-                    content = mem.get("content", "")
-                    if date and content:
-                        parts.append(f"    - [{date}] {content}")
-                    elif content:
-                        parts.append(f"    - {content}")
-
-        return "\n".join(parts)
